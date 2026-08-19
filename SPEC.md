@@ -1,10 +1,16 @@
-# SFTP.cloud signed log format
+# SFTP.cloud signed evidence formats
 
-Chain format version 2. Anchor format v1. Draft, 2026-08-15.
+Chain format version 2. Anchor format v1. Observation batch format v1. Draft, 2026-08-19.
 
-This document specifies the on disk format of the tamper evident logs produced by SFTP.cloud
-components, and the exact procedures for verifying them. It is written so that an independent
-implementation can be built from this document alone, without reading our code.
+This document specifies the formats of the signed evidence SFTP.cloud publishes about itself, and the
+exact procedures for verifying them. It is written so that an independent implementation can be built
+from this document alone, without reading our code.
+
+Sections 1 through 9 cover the tamper evident LOGS the components produce: what a machine did.
+Section 10 covers the availability OBSERVATIONS the independent monitors produce: what an outside
+witness saw. They are separate formats with separate domain strings and no shared bytes, specified
+together because they answer the same question about different evidence, and because in a dispute a
+reader is likely to hold both.
 
 ## 0. What this format proves, and what it does not
 
@@ -474,6 +480,181 @@ Every fixture key is derived from a fixed test seed and is worthless outside the
 - The anchor canonical encoding is **positional**. A new field can only be added by defining a new
   domain string, which makes it a different signature domain and therefore a different format version.
   Nothing may be inserted into, removed from, or reordered within the version 1 encoding.
+- The observation batch canonical encoding is **positional** under the same rule, and its domain string
+  is distinct from the anchor's, so neither can ever be replayed as the other.
 - The format version and the tool version are versioned separately. The tool will move faster than the
   format, and it must be possible to say which format a file is in without reference to which tool
   wrote it.
+
+## 10. Observation batches
+
+An observation batch is a signed statement by one independent monitor about what it saw, minute by
+minute, on a set of targets over a set of UTC days.
+
+It is specified here because SFTP.cloud's service level agreement settles disputes on what a **majority
+of the available monitors** observed, and SFTP.cloud performs that arithmetic. A customer checking a
+service credit therefore needs three things: the monitors' public keys, the signed batches, and an
+encoder they can run themselves. Publishing the first two while keeping the third private would leave
+the evidence checkable only by the party being checked.
+
+### 10.1 What a batch proves, and what it does not
+
+A valid signature proves that the named monitor made exactly this statement, and that nobody has
+altered it since. It does not prove the statement is TRUE: a monitor could report an outage that did
+not happen, or miss one that did.
+
+That is why no single monitor's testimony decides anything. The fleet is placed so that no one hosting
+provider holds a majority of the vote and the provider hosting the measured service holds the minority,
+and a minute is resolved only when at least three monitors reported on it. What this format gives you
+is the ability to check each witness's statement individually, and to see whether any of them went
+missing on the way to you.
+
+**A minute absent from `probed` is neither up nor down.** It is a minute with no evidence, and any
+honest arithmetic over these records must leave it out of the numerator and the denominator together.
+Treating an unprobed minute as an up minute is the single easiest way to read these records too kindly,
+and it is the error that flatters the service provider.
+
+### 10.2 JSON shape
+
+```json
+{
+  "monitor": "mon-aws-use1",
+  "keyFp": "<64 hex>",
+  "seq": 7,
+  "prevBatch": "<64 hex>",
+  "signedAt": "2026-08-19T04:05:06.000000000Z",
+  "entries": [
+    {
+      "target": "head-3",
+      "service": "sftp",
+      "day": "2026-08-19",
+      "probed": "<base64>",
+      "down": "<base64>"
+    }
+  ],
+  "signature": "<128 hex>"
+}
+```
+
+- `monitor` names the vantage point. It is inside the signed bytes deliberately: without it, a batch
+  lifted off one transport and replayed on another would silently become another monitor's testimony,
+  and a quorum is a count of DISTINCT vantage points.
+- `keyFp` is the hex SHA-256 of the signing public key, exactly as in section 5.4. A verifier MUST
+  refuse a batch whose `keyFp` is not the fingerprint of the key it was handed.
+- `seq` is monotonic from 1 across every batch this monitor has ever published, and never restarts. A
+  counter that restarts is indistinguishable from a replay.
+- `prevBatch` is the digest (section 10.5) of the previous batch from this monitor. It is absent or
+  empty only for `seq` 1.
+- `signedAt` is when the signature was produced, which is not when the minutes were observed.
+- `target` and `service` identify what was observed. This format attaches no meaning to either string
+  beyond identity; for SFTP.cloud they are a Head identifier and a protocol name such as `sftp`,
+  `ftpes-explicit`, `ftps-implicit` or `https`.
+- `day` is the UTC day, `YYYY-MM-DD`.
+- `probed` and `down` are minute bitmaps for that UTC day (section 10.3).
+- `signature` is the Ed25519 signature over the canonical bytes of section 10.4.
+
+Batches are bounded: at most 2048 entries, and each bitmap at most 512 base64 characters. A verifier
+MAY refuse a batch that exceeds either.
+
+### 10.3 Minute bitmaps
+
+A UTC day holds 1440 minutes. A bitmap is those 1440 bits, most significant bit first within each byte,
+packed into 180 bytes and then standard base64 encoded. Bit *n* is minute *n* counting from 00:00 UTC.
+
+A bitmap MAY be shorter than 180 bytes once decoded, in which case every minute beyond its length is
+absent. Trailing zero bytes carry no meaning and a producer MAY trim them.
+
+`probed` marks the minutes the monitor looked. `down` marks the minutes it looked and did not get a
+usable answer. In any honest record `down` is a subset of `probed`.
+
+Both are **cumulative for the day** and are republished in full by every batch that touches that day.
+That is what makes a batch idempotent and a lost batch self healing: the next one carries everything
+the lost one did. It also means the newest batch mentioning a given `(target, service, day)` supersedes
+every earlier one for that triple.
+
+Within one batch, a `(target, service, day)` triple MUST NOT appear twice. Two statements about one
+triple would fold into one row wherever they are stored, silently discarding one of them.
+
+### 10.4 Canonical bytes
+
+The signature covers the following byte string, and nothing else. Every field is written in this order,
+positionally; there is no self description and no field is optional.
+
+```
+"sftp.cloud/sla-observation/v1\x00"
+len(monitor)      as uint64 big endian, then monitor
+len(keyFp)        as uint64 big endian, then keyFp
+seq               as uint64 big endian
+len(prevBatch)    as uint64 big endian, then prevBatch
+signedAt          as uint64 big endian, UNIX NANOSECONDS in UTC
+len(entries)      as uint64 big endian
+  for each entry, in canonical order:
+    len(target)   as uint64 big endian, then target
+    len(service)  as uint64 big endian, then service
+    len(day)      as uint64 big endian, then day
+    len(probed)   as uint64 big endian, then probed
+    len(down)     as uint64 big endian, then down
+```
+
+Three details are load bearing and each has a failure it prevents:
+
+- **The domain prefix.** It makes bytes signed for another purpose unreplayable as an observation batch
+  and a batch unreplayable as anything else, even if a future implementation shares a key by mistake.
+  In particular a monitor also signs log anchors, and the two domains keep those apart.
+- **Every string is length prefixed.** Without it, adjacent fields slide across the boundary between
+  them: `{target:"head", service:"1"}` and `{target:"head1", service:""}` would produce identical bytes,
+  and a party controlling one field could forge a claim about another.
+- **The entry count is signed.** Without it a suffix of entries could be truncated and the remaining
+  bytes would still parse as a shorter, perfectly valid batch.
+
+**Canonical order.** Before signing or verifying, entries are sorted by `day`, then `target`, then
+`service`, all as byte comparisons; the sort is stable. `monitor`, `target`, `service`, `day`, `probed`
+and `down` are trimmed of leading and trailing whitespace; `service`, `keyFp` and `prevBatch` are
+lowercased; `signedAt` is converted to UTC. Entry order carries no meaning, so leaving it to the
+producer would make verification fail at random on honest records.
+
+### 10.5 Batch digest
+
+```
+digest = hex( SHA-256( ascii( signature ) ) )
+```
+
+The hash covers the hexadecimal signature TEXT, not the raw signature bytes. This is the same
+construction as the anchor digest in section 5, and the same note applies: reaching for the raw bytes is
+the instinctive choice and produces a different digest.
+
+Taking the digest over the signature rather than the record is deliberate. The signature already commits
+to every field, which makes the digest both shorter and impossible to collide without breaking Ed25519
+first.
+
+### 10.6 Verifying a batch
+
+1. Apply the canonical ordering of section 10.4.
+2. Check the batch is well formed: `monitor` non empty; `keyFp` 64 hex characters; `seq` at least 1;
+   `prevBatch` empty exactly when `seq` is 1 and 64 hex characters otherwise; `signedAt` non zero; at
+   least one entry and no more than 2048; every `day` a valid date; no repeated
+   `(target, service, day)`. **Do this before checking the signature.** A valid signature over an
+   impossible batch is still impossible, and accepting it puts a monitor's name on a claim that cannot
+   be checked against anything.
+3. Check `keyFp` equals the SHA-256 fingerprint of the public key you are verifying with. A record
+   verified under a key it does not name leaves its provenance to be reconstructed by guessing.
+4. Check the Ed25519 signature over the canonical bytes.
+
+### 10.7 Verifying a run, and what a gap means
+
+Given several batches from one monitor, ordered by `seq`:
+
+1. Verify each batch as in section 10.6.
+2. For each adjacent pair, check that the later one has the same `keyFp` and `monitor`, a `seq` exactly
+   one greater, and a `prevBatch` equal to the digest of the earlier one.
+
+A break at step 2 is the finding this chain exists to produce. **Anyone in the path can drop a batch
+they cannot forge; the chain is what stops them hiding the drop.** A missing `seq` with an unmatched
+`prevBatch` names precisely what went missing, and no amount of subsequent well formed traffic closes
+it: continuity is measured from the last position with no hole below it, not from the newest batch.
+
+The same applies to a party holding the batches on the monitor's behalf, including SFTP.cloud. If you
+were given a run by SFTP.cloud and it verifies with no gaps, that establishes that nothing was removed
+from it after the monitor signed it. It does not establish that the monitor sent nothing else. For that,
+compare against a copy you did not get from us, which is the same advice section 6 gives for anchors and
+for the same reason.

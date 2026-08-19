@@ -1,18 +1,27 @@
 # logverify
 
-Verifies the tamper evident logs produced by [SFTP.cloud](https://sftp.cloud) components: the on premises
-Storage Connector, the protocol Heads, and the Portal.
+Verifies the signed evidence [SFTP.cloud](https://sftp.cloud) publishes about itself:
 
-It is published so that the logs can be checked by people who have no reason to trust the party that
-produced them, including us. A verification tool that only its author can run is not a control, it is a
-claim.
+- the **tamper evident logs** produced by its components, the on premises Storage Connector, the protocol
+  Heads, and the Portal: what a machine did;
+- the **availability observations** produced by its independent monitors: what an outside witness saw,
+  minute by minute, and which SFTP.cloud's service level agreement settles credit disputes on.
+
+It is published so that both can be checked by people who have no reason to trust the party that produced
+them, including us. A verification tool that only its author can run is not a control, it is a claim. That
+goes double for the observations, because SFTP.cloud both collects them and performs the arithmetic that
+decides what a customer is owed.
 
 - No dependencies outside the Go standard library.
 - Reads only. It never writes to the evidence it is given, never creates a key, and never repairs a file
   mode.
-- The format is specified in [SPEC.md](SPEC.md), in enough detail to be reimplemented without reading this
-  code. If you would rather write your own verifier than run ours, that is a reasonable thing to want, and
-  the specification exists for exactly that.
+- The formats are specified in [SPEC.md](SPEC.md), in enough detail to be reimplemented without reading
+  this code. If you would rather write your own verifier than run ours, that is a reasonable thing to want,
+  and the specification exists for exactly that.
+- It verifies and cannot sign. There is deliberately no code here that could produce a log line, an anchor
+  or an observation batch: signing belongs to the machine that owns the evidence, and a verifier that could
+  also manufacture evidence would be a strictly worse thing to hand somebody who has stopped trusting the
+  producer.
 
 MIT licensed.
 
@@ -41,6 +50,26 @@ producer.**
 The honest claim, and the only one this tool supports: the producer is cryptographically bound to its
 contemporaneous record and cannot alter it later. Cryptography cannot say whether what was written was true
 when it was written. It can say that nobody rewrote it afterwards.
+
+## What an observation batch proves
+
+Availability observations (SPEC.md section 10) are a different kind of evidence and carry a narrower claim.
+
+A valid signature proves that the named monitor made exactly that statement about what it saw, and that
+nobody has altered it since. It does **not** prove the statement is true. A monitor could report an outage
+that did not happen, or miss one that did.
+
+That is why no single monitor decides anything. The monitors are placed so that no one hosting provider
+holds a majority of the vote and the provider hosting the measured service holds the minority, and a minute
+resolves only when at least three of them reported on it. What this tool gives you is the ability to check
+each witness's statement on its own, and to see whether any of them went missing on the way to you: batches
+are numbered and each names the one before it, so a batch dropped in transit leaves a hole that names
+itself.
+
+One reading error is worth stating plainly because it flatters the service provider: **a minute the monitor
+did not probe is neither up nor down.** It is a minute with no evidence, and it has to leave the numerator
+and the denominator together. Counting unprobed minutes as up turns a monitoring outage into a perfect
+score.
 
 ## Install
 
